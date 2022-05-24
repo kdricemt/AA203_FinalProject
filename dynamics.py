@@ -19,7 +19,7 @@ def twobody_rates(s, t, u, mu):
     Compute the Acceleration for simple two body dynamics
     '''
     r = s[:3]
-    v = s[3:] + u
+    v = s[3:6] + u
     R = np.linalg.norm(r)
     a = -mu*r/R**3
     dydt = np.hstack([v, a])
@@ -40,10 +40,31 @@ def rotation_eci2rsw(r_ECI, v_ECI):
     return T
 
 
+def absolute_dynamics(s, t, u, mu, earth_to_sun, pflag=[True, True, True], update_parameter=True):
+    """
+    Absolute Dynamics of the spacecraft
+    """
+
+
+
 def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag=[True, True, True], update_parameter=True):
     """
-    pflag:  perturbation flag (0: SRP 1: drag, 2: thermal)
-    T: orbital period of the reference orbit
+    Relative Dynamics with respect to the reference orbit
+
+    @ Inputs
+    s: [9,] spacecraft state (in LVLH)  [r(3), v(3), gamma_srp, gamma_D, psi]
+    t: [1,] time from start [sec]
+    u: [3,] control input (in LVLH)
+    mu: [1,] gravity pameter GM
+    state_ref:  [4,] state of the chief (theta, theta_dot, theta_ddot, r0)
+    earth_to_sun: [3,] sun direction
+    rv_eci_ref:  [6,] position and velocity of the chief in ECI
+    T: [1,] orbital period of the reference orbit
+    pflag: [3,] perturbation flag (0: SRP 1: drag, 2: thermal)
+    update_parameters: [1,]  if True, propagate the dynamics propagators as well
+
+    @ Outputs
+    sdot [9,] time derivative of the states
     """
     x, y, z = s[0], s[1], s[2]
     xdot, ydot, zdot = s[3], s[4], s[5]
@@ -55,7 +76,7 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag
     # calculate ECI position of spacecraft
     eci2rsw = rotation_eci2rsw(rv_eci_ref[:3], rv_eci_ref[3:])
     rsw2eci = jnp.block([[eci2rsw.transpose(), jnp.zeros((3,3))],
-                         [jnp.zeros((3,3), eci2rsw.transpose()]])
+                         [jnp.zeros((3,3)), eci2rsw.transpose()]])
     eci_sc = rv_eci_ref + rsw2eci @ s[:6]   # spacecraft r and v in ECI
 
     # calculate perturbation
@@ -100,7 +121,17 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag
 
 
 def unit_sc_to_sun(r_sc, earth_to_sun):
-    u_sun = jnp.array(earth_to_sun) - r_sc  # (S - E) - (sc - E) = S - sc
+    """
+    Compute the unit vector to the sun
+
+    @Input
+    r_sc [3,] position of the spacecraft (ECI)
+    earth_to_sun [3,] position vector from earth to sun
+
+    @Ouput
+    u_sun [3,] unit vector pointing sun from spacecraft
+    """
+    u_sun = earth_to_sun - r_sc  # (S - E) - (sc - E) = S - sc
     u_sun = u_sun / jnp.linalg.norm(u_sun)
 
     return u_sun
@@ -108,15 +139,17 @@ def unit_sc_to_sun(r_sc, earth_to_sun):
 
 def solar_radiation_pressure(gamma_srp, r_ECI, earth_to_sun):
     """
+    gamma:  C_SRP * S [m^2] / m [kg]  ->  m^2/kg
     state: [r(3), v(3), gamma_srp, gamma_D, psi]
     """
     # TODO: Add eclipse?
 
-    P_sun = 1.38    # [kW/m^2]
+    c = 299792.48  # km/s
+    sigma = 1380 / c   #  [W/m^2] / [km/s] = [kg m^2 s/ m^2 km s^3] = [kg / km s^2] @ 1AU
 
     u_sun = unit_sc_to_sun(r_ECI, earth_to_sun)
 
-    a_srp = - P_sun * gamma_srp * u_sun   # [km/s]
+    a_srp = - sigma * gamma_srp * u_sun * 1e-6   # [kg/km s^2]x[m^2/kg] = [m^2/km s^2] -> need to multiply 1e-6
 
     return a_srp
 
@@ -125,9 +158,10 @@ def drag_acceleration(gamma_D, eci_rv):
     """
     state: [r(3), v(3), gamma_srp, gamma_D, psi]
     """
-    r_s = eci_rv[:2]
+    R_EARTH = 6378
+    r_s = eci_rv[:3]
     v_s = eci_rv[3:6]
-    h = jnp.sqrt(r_s)
+    h = jnp.linalg.norm(r_s) - R_EARTH
 
     EarthW = jnp.array([0, 0, 7.2921158553e-5])   # Earth rotation rate [rad/s]
     v_w = jnp.cross(r_s, EarthW)   # wind velocity
@@ -156,7 +190,7 @@ def drag_acceleration(gamma_D, eci_rv):
              1.060067e-13]
         rho = jnp.power(10, ((((((a[7] * h + a[6]) * h + a[5]) * h + a[4]) * h + a[3]) * h + a[2]) * h + a[1]) * h + a[0])
 
-    a_drag = 1/2 * rho * gamma_D * v_r_norm**2 * d    # [km/s]
+    a_drag = 1/2 * rho * gamma_D * v_r_norm**2 * d * 1e3  #  [kg/m^3]x[m^2/kg]x[km^2/s^2] = [km^2/m s^2] -> need to multiply 1000
 
     return a_drag
 
@@ -201,11 +235,9 @@ class Spacecraft:
         self.et0 = epoch_from_string('2022-01-01 12:00:00.000')   # starting time epoch
 
         # fix the sun position for simplicity
-        sun = pk.planet.jpl_lp('sun')
         earth = pk.planet.jpl_lp('earth')
-        r_sun, v = sun.eph(self.et0)
         r_earth, v = earth.eph(self.et0)
-        self.r_sun_to_earth = (r_sun - r_earth) * 1e-3   # km
+        self.earth_to_sun = - jnp.array(r_earth) * 1e-3   # km
 
         self.chief_oe = chief_oe  # a [km], e, i, W, w, E
 
