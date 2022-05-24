@@ -7,6 +7,47 @@ import pykep as pk
 from pykep.core import par2ic, MU_EARTH, epoch_from_string
 import PIL
 
+
+def propagate_absolute_orbit(x0, tspan, controller, mu, earth_to_sun, T,
+                             pflag=[True, True, True], update_parameter=True, debug=False):
+    lent = tspan.size
+    n = x0.size
+    s = np.zeros((lent, n))
+    s[0,:] = x0
+    for k in range(lent-1):
+        t = tspan[k]
+        u = controller(t, s[k])
+        s[k+1, :] = odeint(absolute_dynamics, s[k,:], tspan[k:k+2],
+                           (u, mu, earth_to_sun, T, pflag, update_parameter))[1]
+        if debug:
+            print("Step:{0:4d}/{1:4d} | x= {2:.2e}  y = {3:.2e}  z= {4:.2e}".format(k+1, lent, s[k+1,0], s[k+1,1], s[k+1,2]))
+
+    return s
+
+def propagate_relative_orbit(x0, tspan, controller, mu, earth_to_sun, T,
+                             pflag=[True, True, True], update_parameter=True, debug=False):
+    """
+    Currently this does not work
+    We have to think of a way to pass cheif (reference) orbit at each timstep that ode solver chooses
+    """
+
+    lent = tspan.size
+    n = x0.size
+    s = np.zeros((lent, n))
+    s[0,:] = x0
+
+    for k in range(lent-1):
+        t = tspan[k]
+        u = controller(t, s[k])
+
+        s[k+1, :] = odeint(relative_dynamics, s[k,:], tspan[k:k+2],
+                           (u, mu, earth_to_sun, T, pflag, update_parameter))[1]
+        if debug:
+            print("Step:{0:4d}/{1:4d} | x= {2:.2e}  y = {3:.2e}  z= {4:.2e}".format(k+1, lent, s[k+1,0], s[k+1,1], s[k+1,2]))
+
+    return s
+
+
 def unit_vector(v):
     """
     Compute unit vector
@@ -19,9 +60,9 @@ def twobody_rates(s, t, u, mu):
     Compute the Acceleration for simple two body dynamics
     '''
     r = s[:3]
-    v = s[3:6] + u
+    v = s[3:6]
     R = np.linalg.norm(r)
-    a = -mu*r/R**3
+    a = -mu*r/R**3 + u
     dydt = np.hstack([v, a])
     return dydt
 
@@ -30,24 +71,61 @@ def rotation_eci2rsw(r_ECI, v_ECI):
     # Covert from ECI to LVLH
     rvec = unit_vector(r_ECI)
     # cross-track
-    wvec = unit_vector(np.cross(r_ECI,v_ECI))
+    wvec = unit_vector(jnp.cross(r_ECI,v_ECI))
     # along-track
-    svec = unit_vector(np.cross(wvec,rvec))
+    svec = unit_vector(jnp.cross(wvec,rvec))
 
     # transformation matrix (ECI to RSW)
-    T = np.vstack([rvec, svec, wvec])
+    T = jnp.vstack([rvec, svec, wvec])
 
     return T
 
-
-def absolute_dynamics(s, t, u, mu, earth_to_sun, pflag=[True, True, True], update_parameter=True):
+def absolute_dynamics(s, t, u, mu, earth_to_sun, T,
+                      pflag=[True, True, True], update_parameter=True, debug=False):
     """
     Absolute Dynamics of the spacecraft
     """
 
+    # Two body dynamics
+    r = s[:3]
+    R = jnp.linalg.norm(r)
+    a_body = -mu*r/R**3
+
+    gamma_srp, gamma_D, psi = s[6], s[7], s[8]
+
+    # calculate perturbation
+    if pflag[0]:
+        a_srp = solar_radiation_pressure(gamma_srp, s[:3], earth_to_sun)
+    else:
+        a_srp = jnp.zeros(3)
+
+    if pflag[1]:
+        a_drag = drag_acceleration(gamma_D, s[:6])
+    else:
+        a_drag = jnp.zeros(3)
+
+    # calculate perturbated control input
+    if pflag[2] and jnp.any(u):
+        u_p = thermal_fluttering(psi, u, earth_to_sun, s[:6], jnp.eye(3))  # No need to convert to LVLH -> pass eye matrix for eci2rsw
+    else:
+        u_p = u
+
+    a_total = a_body + a_srp + a_drag + u_p
+
+    if debug:
+        print("Total Acceleration: {}".format(jnp.linalg.norm(a_total)))
+
+    if update_parameter:
+        sdot = jnp.hstack([s[3:6], a_total, parameter_dynamics(t, T)])
+    else:
+        sdot = jnp.hstack([s[3:6], a_total, jnp.zeros(3)])
+
+    return sdot
 
 
-def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag=[True, True, True], update_parameter=True):
+
+def relative_dynamics(s, t, u, mu, earth_to_sun, T,
+                      pflag=[True, True, True], update_parameter=True, debug=False):
     """
     Relative Dynamics with respect to the reference orbit
 
@@ -58,7 +136,7 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag
     mu: [1,] gravity pameter GM
     state_ref:  [4,] state of the chief (theta, theta_dot, theta_ddot, r0)
     earth_to_sun: [3,] sun direction
-    rv_eci_ref:  [6,] position and velocity of the chief in ECI
+    state_eci_ref:  [9,] position and velocity of the chief in ECI
     T: [1,] orbital period of the reference orbit
     pflag: [3,] perturbation flag (0: SRP 1: drag, 2: thermal)
     update_parameters: [1,]  if True, propagate the dynamics propagators as well
@@ -68,25 +146,32 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag
     """
     x, y, z = s[0], s[1], s[2]
     xdot, ydot, zdot = s[3], s[4], s[5]
-    theta, theta_dot, theta_ddot, r0 = state_ref[0], state_ref[1], state_ref[2], state_ref[3]
     gamma_srp, gamma_D, psi = s[6], s[7], s[8]
+    state_eci_ref = jnp.hstack([s[9:15], s[6:9]])   # Reference Orbit state
 
-    sdot = np.zeros_like(s)
+    # First calculate the accelaration the reference orbit
+    ref_dot = absolute_dynamics(state_eci_ref, t, u, mu, earth_to_sun, T,
+                                pflag=[False, False, False], update_parameter=False, debug=False)
+
+    # Calculate theta_dot, theta_ddot
+    eci2rsw = rotation_eci2rsw(state_eci_ref[:3], state_eci_ref[3:6])
+    r0 = jnp.linalg.norm(state_eci_ref[:3])
+    h = jnp.linalg.norm(jnp.cross(state_eci_ref[:3], state_eci_ref[3:6]))
+    theta_dot = h / r0**2
+    rdot_rsw = eci2rsw @ state_eci_ref[3:6]
+    theta_ddot = - 2 * rdot_rsw[0] * theta_dot / r0
 
     # calculate ECI position of spacecraft
-    eci2rsw = rotation_eci2rsw(rv_eci_ref[:3], rv_eci_ref[3:])
-    rsw2eci = jnp.block([[eci2rsw.transpose(), jnp.zeros((3,3))],
-                         [jnp.zeros((3,3)), eci2rsw.transpose()]])
-    eci_sc = rv_eci_ref + rsw2eci @ s[:6]   # spacecraft r and v in ECI
+    eci_sc = lvlh_to_eci(state_eci_ref[:6], s[:6])   # spacecraft r and v in ECI
 
     # calculate perturbation
     if pflag[0]:
-        a_srp = solar_radiation_pressure(s, eci_sc[:3], earth_to_sun)
+        a_srp = solar_radiation_pressure(gamma_srp, eci_sc[:3], earth_to_sun)
     else:
         a_srp = jnp.zeros(3)
 
     if pflag[1]:
-        a_drag = drag_acceleration(s, eci_sc)
+        a_drag = drag_acceleration(gamma_D, eci_sc)
     else:
         a_drag = jnp.zeros(3)
 
@@ -94,28 +179,21 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag
     d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
 
     # calculate perturbated control input
-    if pflag[2]:
+    if pflag[2] and jnp.any(u):
         u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
     else:
         u_p = u
 
-    tmp = jnp.power((r0 + x)**2 + y**2 + z**2, 3/2)
-    xddot = 2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/tmp + mu/r0**2 + d_rsw[0] + u_p[0]
-    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/tmp + d_rsw[1] + u_p[1]
-    zddot = - mu * z/tmp + d_rsw[2] + u_p[2]
-
-    sdot[0] = xdot
-    sdot[1] = ydot
-    sdot[2] = zdot
-    sdot[3] = xddot
-    sdot[4] = yddot
-    sdot[5] = zddot
+    r_sc = jnp.linalg.norm(eci_sc)
+    xddot =   2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/r_sc**3 + mu/r0**2 + d_rsw[0] + u_p[0]
+    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/r_sc**3 + d_rsw[1] + u_p[1]
+    zddot = - mu * z/r_sc**3 + d_rsw[2] + u_p[2]
 
     # The parameter is updated
     if update_parameter:
-        sdot[6] = jnp.cos(t/T)   # gamma_srp
-        sdot[7] = jnp.cos(t/T)   # gamma_D
-        sdot[8] = jnp.cos(t/T)   # psi
+        sdot = jnp.hstack([xdot, ydot, zdot, xddot, yddot, zddot, parameter_dynamics(t, T), ref_dot[:6]])
+    else:
+        sdot = jnp.hstack([xdot, ydot, zdot, xddot, yddot, zddot, jnp.zeros(3), ref_dot[:6]])
 
     return sdot
 
@@ -201,7 +279,7 @@ def Rx(theta):
     """
     s = jnp.sin(theta)
     c = jnp.cos(theta)
-    M = jnp.array([[1.0, 0.0, 0,0],
+    M = jnp.array([[1.0, 0.0, 0.0],
                   [0.0, +c, +s],
                   [0.0, -s, +c]])
     return M
@@ -223,64 +301,68 @@ def thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw):
     eci2local = jnp.vstack([e_x, e_y, e_z])
     local2rsw = eci2rsw @ eci2local.transpose()  # local -> eci -> rsw
 
-    u_p = local2rsw @ Rx(psi) @ local2rsw.transpose() @ u
+    M = local2rsw @ Rx(psi) @ local2rsw.transpose()
+    u_p = M @ u
 
     return u_p
 
 
-class Spacecraft:
-    def __init__(self, chief_oe):
-        # system parameters
-        self.mu = MU_EARTH * 1e-9
-        self.et0 = epoch_from_string('2022-01-01 12:00:00.000')   # starting time epoch
+def parameter_dynamics(t, T):
+    """
+    Oscillation in the SRP, drag, and thermal fluttering parameters
 
-        # fix the sun position for simplicity
-        earth = pk.planet.jpl_lp('earth')
-        r_earth, v = earth.eph(self.et0)
-        self.earth_to_sun = - jnp.array(r_earth) * 1e-3   # km
+    T: orbital period of the reference orbit
+    """
+    p = jnp.zeros(3)
+    max_psi = 5 * jnp.pi / 180   # 5 deg
+    C_D = 1.5   # []
+    C_SRP = 1.5  # []
+    A = 1.0  # m^2
+    m = 50   # kg
+    gamma_SRP_nominal = C_SRP * A / m
+    gamma_D_nominal = C_D * A / m
 
-        self.chief_oe = chief_oe  # a [km], e, i, W, w, E
-
-
-    def absolute_dynamics(self, s, t, u, mu):
-        '''
-        Compute the Acceleration for simple two body dynamics
-        '''
-        r = s[:3]
-        v = s[3:] + u
-        R = np.linalg.norm(r)
-        a = -mu*r/R**3
-        dydt = np.hstack([v, a])
-        return dydt
-
-    def propagate_reference_state(self, tsim):
-        n = np.sqrt(self.mu/self.chief_oe[0]**3)
-        a = self.chief_oe[0]
-        e = self.chief_oe[1]
-        s0 = np.array([0, n / np.power((1 - e**2), 3/2) * np.power(1 + e, 2), 0, 0])
-
-        lent = tsim.size
-        s = np.zeros((lent, 4))
-        s[0, :] = s0
-
-        def ref_dynamics(s, t, mu):
-            theta = s[0]
-            theta_dot = s[1]
-            # theta_dot = n / np.power((1 - e**2), 3/2) * np.power(1 + e * jnp.cos(theta), 2)
-            theta_ddot = - 2 * n**2 * np.sin(theta) * np.power((1 + e * np.cos(theta))/ (1 - e**2), 3)
-            return np.array([theta_dot, theta_ddot])
-
-        for k in range(lent - 1):
-            s[k + 1, :2] = odeint(ref_dynamics, s[k, :2], tsim[k:k + 2])[1]
-            s[k + 1, 2] = - 2 * n**2 * np.sin(s[k+1, 0]) * np.power((1 + e * np.cos(s[k+1, 0]))/ (1 - e**2), 3)
-
-        # compute orbit radius
-        r0 = a * (1 - e**2) * np.ones_like(s[:, 0]) / (1 + e * np.cos(s[:, 0]))
-        s[:, 3] = r0
-
-        return s
+    p = jnp.array([0.05 * gamma_SRP_nominal * (2*jnp.pi/T) * jnp.cos(2*jnp.pi*t/T),  # gamma SRP
+                   0.05 * gamma_D_nominal * (2*jnp.pi/T) * jnp.cos(2*jnp.pi*t/T),  # gamma D
+                   max_psi * (2*jnp.pi/T) * jnp.cos(2*jnp.pi*t/T)]) # psi
+    return p
 
 
+def propagate_theta(mu, ref_oe, tsim):
+    n = np.sqrt(mu/ref_oe[0]**3)
+    a = ref_oe[0]
+    e = ref_oe[1]
+    s0 = jnp.array([0, n / np.power((1 - e**2), 3/2) * np.power(1 + e, 2), 0, 0])
+
+    lent = tsim.size
+    s = np.zeros((lent, 4))
+    s[0, :] = s0
+
+    def ref_dynamics(s, t, mu):
+        theta = s[0]
+        theta_dot = s[1]
+        # theta_dot = n / np.power((1 - e**2), 3/2) * np.power(1 + e * jnp.cos(theta), 2)
+        theta_ddot = - 2 * n**2 * np.sin(theta) * np.power((1 + e * np.cos(theta))/ (1 - e**2), 3)
+        return np.array([theta_dot, theta_ddot])
+
+    for k in range(lent - 1):
+        s[k + 1, :2] = odeint(ref_dynamics, s[k, :2], tsim[k:k + 2], (mu,))[1]
+        s[k + 1, 2] = - 2 * n**2 * np.sin(s[k+1, 0]) * np.power((1 + e * np.cos(s[k+1, 0]))/ (1 - e**2), 3)
+
+    # compute orbit radius
+    r0 = a * (1 - e**2) * np.ones_like(s[:, 0]) / (1 + e * np.cos(s[:, 0]))
+    s[:, 3] = r0
+
+    return s
+
+def compute_earth_to_sun():
+    et0 = epoch_from_string('2022-01-01 12:00:00.000')   # starting time epoch
+
+    # fix the sun position for simplicity
+    earth = pk.planet.jpl_lp('earth')
+    r_earth, v = earth.eph(et0)
+    earth_to_sun = - jnp.array(r_earth) * 1e-3   # km
+    return earth_to_sun
 
 
 def eci2rsw(r_ECI,v_ECI):
@@ -294,33 +376,61 @@ def eci2rsw(r_ECI,v_ECI):
     return T, rRSW, vRSW
 
 
-def eci_to_lvlh(r_target,v_target,r_chaise,v_chaise):
+def eci_to_lvlh(s_chief, s_deputy):
     """
     Calculate the relative position and velocity in the LVLH frame
+    "Orbital Mechanics for Engineering Students", p 317
     # Coordinates
     #   - LVLH frame
     #      - R: +radial direction
     #      - S: +velocity along-track
     #      - W: +angular momentum vector (cross-track)
     """
+    r_chief = s_chief[:3]
+    r_deputy = s_deputy[:3]
+    v_chief = s_chief[3:6]
+    v_deputy = s_deputy[3:6]
 
-    r_target_norm  = np.linalg.norm(r_target)
-    r_chaise_norm  = np.linalg.norm(r_chaise)
-    v_target_norm  = np.linalg.norm(v_target)
+    r_chief_norm = np.linalg.norm(r_chief)
 
-    # convert chaiser to ECI -> RSW  
-    M_ECI2RSW = rotation_eci2rsw(r_target,v_target)
-    n_target = v_target_norm/r_target_norm
+    # convert deputyr to ECI -> RSW  
+    M_ECI2RSW = rotation_eci2rsw(r_chief,v_chief)
+    omega = jnp.cross(r_chief, v_chief) / (r_chief_norm**2)
 
     # show relative state in RSW (LVLH) coordinate
-    r_rho_RSW  = M_ECI2RSW @ (r_chaise - r_target).reshape((3,1))
-    v_rho_RSW = M_ECI2RSW @ (v_chaise - v_target).reshape((3,1)) - np.array([-n_target * r_rho_RSW[1], n_target*r_rho_RSW[0], 0]).reshape((3,1))
+    r_rel_ECI = r_deputy - r_chief
+    r_rel_RSW = M_ECI2RSW @ r_rel_ECI
+
+    v_rel_ECI = (v_deputy - v_chief) - jnp.cross(omega, r_rel_ECI)  # in ECI
+    v_rel_RSW = M_ECI2RSW @ v_rel_ECI
 
     # Convert from LVLH to orbital frame
-    r_lvlh = np.array([r_rho_RSW[1], -r_rho_RSW[2], -r_rho_RSW[0]])
-    v_lvlh = np.array([v_rho_RSW[1], -v_rho_RSW[2], -v_rho_RSW[0]])
+    rv_lvlh = jnp.hstack([r_rel_RSW, v_rel_RSW])
 
-    return r_lvlh, v_lvlh
+    return rv_lvlh
+
+def lvlh_to_eci(s_chief, lvlh_deputy):
+    """
+    Calculate the ECI orbit of deputy from the chief orbit and the deputy LVLH
+
+    """
+    r_chief = s_chief[:3]
+    r_rel_RSW = lvlh_deputy[:3]
+    v_chief = s_chief[3:6]
+    v_rel_RSW = lvlh_deputy[3:6]
+
+    # transformation matrix
+    r_chief_norm = jnp.linalg.norm(r_chief)
+    M_ECI2RSW = rotation_eci2rsw(r_chief, v_chief)
+    omega = jnp.cross(r_chief, v_chief) / (r_chief_norm ** 2)
+
+    r_deputy = r_chief + M_ECI2RSW.transpose() @ r_rel_RSW
+    r_rel_ECI = r_deputy - r_chief
+    v_deputy = v_chief + jnp.cross(omega, r_rel_ECI) + M_ECI2RSW.transpose() @ v_rel_RSW
+
+    rv_deputy = jnp.hstack([r_deputy, v_deputy])
+
+    return rv_deputy
 
 
 def cw_stm(X0, t, n):
@@ -360,24 +470,12 @@ def cw_stm(X0, t, n):
 
     return x_t, Phi
 
+
 def zero_control(t, s):
-    return np.zeros(3)
+    return jnp.zeros(3)
 
 
-def propagate_absolute_orbit(x0, tspan, controller, mu):
-    lent = tspan.size
-    n = x0.size
-    s = np.zeros((lent,n))
-    s[0,:] = x0
-    for k in range(lent-1):
-        t = tspan[k]
-        u = controller(t, s[k])
-        s[k+1, :] = odeint(twobody_rates, s[k,:], tspan[k:k+2], (u, mu))[1]
-
-    return s
-
-
-def plot_orbits(sc, sd):
+def plot_absolute_orbits(sc, sd):
     fig = plt.figure()
     ax = plt.axes(projection='3d')
 
@@ -402,16 +500,13 @@ def plot_orbits(sc, sd):
     ax.set_ylabel('y')
     plt.legend()
 
-    plt.savefig("absolute_orbit.png")
-
 
 def plot_relative_orbit_from_abs(tspan, sc, sd):
     lent = tspan.size
     n = 6
     x_lvlh = np.zeros((lent,n))
     for k in range(lent):
-        r_lvlh, v_lvlh = eci_to_lvlh(sc[k,:3], sc[k, 3:], sd[k,:3], sd[k,3:])
-        x_lvlh[k,:] = np.vstack([r_lvlh, v_lvlh]).flatten()
+        x_lvlh[k, :] = np.array(eci_to_lvlh(sc[k,:6], sd[k,:6]))
 
     plt.figure()
     plt.subplot(2,1,1)
@@ -433,4 +528,27 @@ def plot_relative_orbit_from_abs(tspan, sc, sd):
 
     plt.savefig("relative_orbit.png")
 
+    plt.show()
+
+    return x_lvlh
+
+
+def plot_relative_orbit(tspan, s_rel):
+    plt.figure()
+    plt.subplot(2, 1, 1)
+    lab = ["x", "y", "z", "vx", "vy", "vz"]
+    for i in range(3):
+        plt.plot(tspan, s_rel[:, i], label=lab[i])
+    plt.grid()
+    plt.xlabel('Time [s]')
+    plt.ylabel('Position  [km]')
+    plt.legend()
+
+    plt.subplot(2, 1, 2)
+    for i in range(3):
+        plt.plot(tspan, s_rel[:, i + 3], label=lab[i + 3])
+    plt.grid()
+    plt.xlabel('Time [s]')
+    plt.ylabel('Velocity [km/s]')
+    plt.legend()
     plt.show()
