@@ -26,27 +26,50 @@ def twobody_rates(s, t, u, mu):
     return dydt
 
 
-def relative_dynamics(s, t, u, mu, state_chief, earth_to_sun):
-    """
+def rotation_eci2rsw(r_ECI, v_ECI):
+    # Covert from ECI to LVLH
+    rvec = unit_vector(r_ECI)
+    # cross-track
+    wvec = unit_vector(np.cross(r_ECI,v_ECI))
+    # along-track
+    svec = unit_vector(np.cross(wvec,rvec))
 
-    start_jday: julian day since J2000 of the starting simulation time
+    # transformation matrix (ECI to RSW)
+    T = np.vstack([rvec, svec, wvec])
+
+    return T
+
+
+def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, update_parameter=True):
+    """
+    T: orbital period of the reference orbit
     """
     x, y, z = s[0], s[1], s[2]
     xdot, ydot, zdot = s[3], s[4], s[5]
-    theta, theta_dot, theta_ddot, r0 = state_chief[0], state_chief[1], state_chief[2], state_chief[3]
+    theta, theta_dot, theta_ddot, r0 = state_ref[0], state_ref[1], state_ref[2], state_ref[3]
+    gamma_srp, gamma_D, psi = s[6], s[7], s[8]
+
     sdot = np.zeros_like(s)
 
+    # calculate ECI position of spacecraft
+    eci2rsw = rotation_eci2rsw(rv_eci_ref[:3], rv_eci_ref[3:])
+    rsw2eci = jnp.block([[eci2rsw.transpose(), jnp.zeros((3,3))],
+                         [jnp.zeros((3,3), eci2rsw.transpose()]])
+    eci_sc = rv_eci_ref + rsw2eci @ s[:6]   # spacecraft r and v in ECI
+
+    # calculate perturbation in ECI frame
+    a_srp = solar_radiation_pressure(s, eci_sc[:3], earth_to_sun)
+    a_drag = drag_acceleration(s, eci_sc)
+    d_ECI = a_srp + a_drag
+    d_rsw = eci2rsw @ d_ECI
+
+    # calculate perturbated control input
+    u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+
     tmp = jnp.power((r0 + x)**2 + y**2 + z**2, 3/2)
-
-    a_srp = solar_radiation_pressure(s, earth_to_sun)
-    a_drag = drag_acceleration(s)
-    u_p = thermal_fluttering(s, earth_to_sun)
-
-    d = a_srp + a_drag + u_p
-
-    xddot = 2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/tmp + mu/r0**2 + d[0]
-    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/tmp + d[1]
-    zddot = - mu * z/tmp + d[2]
+    xddot = 2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/tmp + mu/r0**2 + d_rsw[0] + u_p[0]
+    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/tmp + d_rsw[1] + u_p[1]
+    zddot = - mu * z/tmp + d_rsw[2] + u_p[2]
 
     sdot[0] = xdot
     sdot[1] = ydot
@@ -55,32 +78,41 @@ def relative_dynamics(s, t, u, mu, state_chief, earth_to_sun):
     sdot[4] = yddot
     sdot[5] = zddot
 
+    # The parameter is updated
+    if update_parameter:
+        sdot[6] = jnp.cos(t/T)   # gamma_srp
+        sdot[7] = jnp.cos(t/T)   # gamma_D
+        sdot[8] = jnp.cos(t/T)   # psi
+
     return sdot
 
+def unit_sc_to_sun(r_sc, earth_to_sun):
+    u_sun = jnp.array(earth_to_sun) - r_sc  # (S - E) - (sc - E) = S - sc
+    u_sun = u_sun / jnp.linalg.norm(u_sun)
 
-def solar_radiation_pressure(s, earth_to_sun):
+    return u_sun
+
+def solar_radiation_pressure(gamma_srp, r_ECI, earth_to_sun):
     """
     state: [r(3), v(3), gamma_srp, gamma_D, psi]
     """
-    gamma_srp = s[6]
+    # TODO: Add eclipse?
+
     P_sun = 1.38    # [kW/m^2]
 
-    r_sc = s[:3]
-    u_sun = jnp.array(earth_to_sun) - r_sc  # (S - E) - (sc - E) = S - sc
-    u_sun = u_sun / jnp.linalg.norm(u_sun)
+    u_sun = unit_sc_to_sun(r_ECI, earth_to_sun)
 
     a_srp = - P_sun * gamma_srp * u_sun   # [km/s]
 
     return a_srp
 
 
-def drag_acceleration(s):
+def drag_acceleration(gamma_D, eci_rv):
     """
     state: [r(3), v(3), gamma_srp, gamma_D, psi]
     """
-    gamma_D = s[7]
-    r_s = s[:2]
-    v_s = s[3:6]
+    r_s = eci_rv[:2]
+    v_s = eci_rv[3:6]
     h = jnp.sqrt(r_s)
 
     EarthW = jnp.array([0, 0, 7.2921158553e-5])   # Earth rotation rate [rad/s]
@@ -115,6 +147,37 @@ def drag_acceleration(s):
     return a_drag
 
 
+def Rx(theta):
+    """
+    Rotation vector around x-axis
+    """
+    s = jnp.sin(theta)
+    c = jnp.cos(theta)
+    M = jnp.array([[1.0, 0.0, 0,0],
+                  [0.0, +c, +s],
+                  [0.0, -s, +c]])
+    return M
+
+
+def thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw):
+    """
+    Perturbation to control due to thermal fluttering
+    state: [r(3), v(3), gamma_srp, gamma_D, psi]
+    """
+    u_sun = unit_sc_to_sun(eci_sc[:3], earth_to_sun)
+
+    # e_x, e_y, e_z is the local solar panel frame vector in ECI
+    e_z = u_sun
+    e_y = jnp.cross(u_sun, eci_sc[:2])
+    e_y = e_y / jnp.linalg.norm(e_y)
+    e_x = jnp.cross(e_y, e_z)
+
+    eci2local = jnp.vstack([e_x, e_y, e_z])
+    local2rsw = eci2rsw @ eci2local.transpose()  # local -> eci -> rsw
+
+    u_p = local2rsw @ Rx(psi) @ local2rsw.transpose() @ u
+
+    return u_p
 
 
 class Spacecraft:
@@ -186,20 +249,9 @@ class Spacecraft:
 
 
 
-
-
-
-
 def eci2rsw(r_ECI,v_ECI):
-    # Covert from ECI to LVLH
-    rvec = unit_vector(r_ECI)
-    # cross-track
-    wvec = unit_vector(np.cross(r_ECI,v_ECI))
-    # along-track
-    svec = unit_vector(np.cross(wvec,rvec))
-
     # transformation matrix (ECI to RSW)
-    T = np.vstack([rvec, svec, wvec])
+    T = rotation_eci2rsw(r_ECI, v_ECI)
 
     # position anc velocity
     rRSW = T @ r_ECI
@@ -223,7 +275,7 @@ def eci_to_lvlh(r_target,v_target,r_chaise,v_chaise):
     v_target_norm  = np.linalg.norm(v_target)
 
     # convert chaiser to ECI -> RSW  
-    M_ECI2RSW, dum1, dum2 = eci2rsw(r_target,v_target)
+    M_ECI2RSW = rotation_eci2rsw(r_target,v_target)
     n_target = v_target_norm/r_target_norm
 
     # show relative state in RSW (LVLH) coordinate
