@@ -10,6 +10,9 @@ import PIL
 
 def propagate_absolute_orbit(x0, tspan, controller, mu, earth_to_sun, T,
                              pflag=[True, True, True], update_parameter=True, debug=False):
+    """
+    Propagate absolute orbit of the satellite
+    """
     lent = tspan.size
     n = x0.size
     s = np.zeros((lent, n))
@@ -27,10 +30,8 @@ def propagate_absolute_orbit(x0, tspan, controller, mu, earth_to_sun, T,
 def propagate_relative_orbit(x0, tspan, controller, mu, earth_to_sun, T,
                              pflag=[True, True, True], update_parameter=True, debug=False):
     """
-    Currently this does not work
-    We have to think of a way to pass cheif (reference) orbit at each timstep that ode solver chooses
+    Propagate relative orbit along with the absolute orbit of the reference
     """
-
     lent = tspan.size
     n = x0.size
     s = np.zeros((lent, n))
