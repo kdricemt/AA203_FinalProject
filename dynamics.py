@@ -40,8 +40,9 @@ def rotation_eci2rsw(r_ECI, v_ECI):
     return T
 
 
-def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, update_parameter=True):
+def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, pflag=[True, True, True], update_parameter=True):
     """
+    pflag:  perturbation flag (0: SRP 1: drag, 2: thermal)
     T: orbital period of the reference orbit
     """
     x, y, z = s[0], s[1], s[2]
@@ -57,14 +58,25 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, updat
                          [jnp.zeros((3,3), eci2rsw.transpose()]])
     eci_sc = rv_eci_ref + rsw2eci @ s[:6]   # spacecraft r and v in ECI
 
-    # calculate perturbation in ECI frame
-    a_srp = solar_radiation_pressure(s, eci_sc[:3], earth_to_sun)
-    a_drag = drag_acceleration(s, eci_sc)
-    d_ECI = a_srp + a_drag
-    d_rsw = eci2rsw @ d_ECI
+    # calculate perturbation
+    if pflag[0]:
+        a_srp = solar_radiation_pressure(s, eci_sc[:3], earth_to_sun)
+    else:
+        a_srp = jnp.zeros(3)
+
+    if pflag[1]:
+        a_drag = drag_acceleration(s, eci_sc)
+    else:
+        a_drag = jnp.zeros(3)
+
+    d_ECI = a_srp + a_drag   # in ECI frame
+    d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
 
     # calculate perturbated control input
-    u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+    if pflag[2]:
+        u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+    else:
+        u_p = u
 
     tmp = jnp.power((r0 + x)**2 + y**2 + z**2, 3/2)
     xddot = 2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/tmp + mu/r0**2 + d_rsw[0] + u_p[0]
@@ -86,11 +98,13 @@ def relative_dynamics(s, t, u, mu, state_ref, earth_to_sun, rv_eci_ref, T, updat
 
     return sdot
 
+
 def unit_sc_to_sun(r_sc, earth_to_sun):
     u_sun = jnp.array(earth_to_sun) - r_sc  # (S - E) - (sc - E) = S - sc
     u_sun = u_sun / jnp.linalg.norm(u_sun)
 
     return u_sun
+
 
 def solar_radiation_pressure(gamma_srp, r_ECI, earth_to_sun):
     """
@@ -206,18 +220,6 @@ class Spacecraft:
         a = -mu*r/R**3
         dydt = np.hstack([v, a])
         return dydt
-
-
-    def sun_direction(self, s):
-        """
-        Return spacecraft to sun direction
-        """
-        r_sc = s[:3]
-        d = jnp.array(self.r_sun_to_earth) - r_sc
-        d = d / jnp.linalg.norm(d)
-
-        return d
-
 
     def propagate_reference_state(self, tsim):
         n = np.sqrt(self.mu/self.chief_oe[0]**3)
