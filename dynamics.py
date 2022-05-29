@@ -156,14 +156,9 @@ def relative_dynamics(s, t, u, mu, earth_to_sun, T,
 
     # Calculate theta_dot, theta_ddot
     eci2rsw = rotation_eci2rsw(state_eci_ref[:3], state_eci_ref[3:6])
-    r0 = jnp.linalg.norm(state_eci_ref[:3])
-    h = jnp.linalg.norm(jnp.cross(state_eci_ref[:3], state_eci_ref[3:6]))
-    theta_dot = h / r0**2
-    rdot_rsw = eci2rsw @ state_eci_ref[3:6]
-    theta_ddot = - 2 * rdot_rsw[0] * theta_dot / r0
 
     # calculate ECI position of spacecraft
-    eci_sc = lvlh_to_eci(state_eci_ref[:6], s[:6])   # spacecraft r and v in ECI
+    eci_sc = lvlh_to_eci(state_eci_ref[:6], s[:6])  # spacecraft r and v in ECI
 
     # calculate perturbation
     if pflag[0]:
@@ -176,7 +171,7 @@ def relative_dynamics(s, t, u, mu, earth_to_sun, T,
     else:
         a_drag = jnp.zeros(3)
 
-    d_ECI = a_srp + a_drag   # in ECI frame
+    d_ECI = a_srp + a_drag  # in ECI frame
     d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
 
     # calculate perturbated control input
@@ -185,16 +180,26 @@ def relative_dynamics(s, t, u, mu, earth_to_sun, T,
     else:
         u_p = u
 
+    acc_residuals = d_rsw + u_p
+
+    if update_parameter:
+        dparam_dt = parameter_dynamics(t, T)
+    else:
+        dparam_dt = jnp.zeros(3)
+
+    # Calculate theta_dot, theta_ddot
+    r0 = jnp.linalg.norm(state_eci_ref[:3])
+    h = jnp.linalg.norm(jnp.cross(state_eci_ref[:3], state_eci_ref[3:6]))
+    theta_dot = h / r0**2
+    rdot_rsw = eci2rsw @ state_eci_ref[3:6]
+    theta_ddot = - 2 * rdot_rsw[0] * theta_dot / r0
     r_sc = jnp.linalg.norm(eci_sc)
-    xddot =   2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/r_sc**3 + mu/r0**2 + d_rsw[0] + u_p[0]
-    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/r_sc**3 + d_rsw[1] + u_p[1]
-    zddot = - mu * z/r_sc**3 + d_rsw[2] + u_p[2]
+    xddot =   2 * theta_dot * ydot + theta_ddot * y + theta_dot**2 * x - mu * (r0 + x)/r_sc**3 + mu/r0**2 + acc_residuals[0]
+    yddot = - 2 * theta_dot * xdot - theta_ddot * x + theta_dot**2 * y - mu * y/r_sc**3 + acc_residuals[1]
+    zddot = - mu * z/r_sc**3 + acc_residuals[2]
 
     # The parameter is updated
-    if update_parameter:
-        sdot = jnp.hstack([xdot, ydot, zdot, xddot, yddot, zddot, parameter_dynamics(t, T), ref_dot[:6]])
-    else:
-        sdot = jnp.hstack([xdot, ydot, zdot, xddot, yddot, zddot, jnp.zeros(3), ref_dot[:6]])
+    sdot = jnp.hstack([xdot, ydot, zdot, xddot, yddot, zddot, dparam_dt, ref_dot[:6]])
 
     return sdot
 
@@ -251,23 +256,23 @@ def drag_acceleration(gamma_D, eci_rv):
     # compute atomospheric density
     # Reference:
     #         https://www.spaceacademy.net.au/watch/debris/atmosmod.htm
-    if h >= 180:
-        F_10 = 300
-        Ap = 0
-        T = 900 + 2.5 * (F_10 - 70) + 1.5 * Ap
-        mu = 27 - 0.012 * (h - 200)
-        H = T / mu
-        rho = 6e-10 * jnp.exp(- (h - 175)/ H)
-    else:
-        a = [7.001985e-02,
-             -4.336216e-03,
-             -5.009831e-03,
-             1.621827e-04,
-             -2.471283e-06,
-             1.904383e-08,
-             -7.189421e-11,
-             1.060067e-13]
-        rho = jnp.power(10, ((((((a[7] * h + a[6]) * h + a[5]) * h + a[4]) * h + a[3]) * h + a[2]) * h + a[1]) * h + a[0])
+    F_10 = 300
+    Ap = 0
+    T = 900 + 2.5 * (F_10 - 70) + 1.5 * Ap
+    mu = 27 - 0.012 * (h - 200)
+    H = T / mu
+    rho = 6e-10 * jnp.exp(- (h - 175)/ H)
+
+    # for < 180
+    # a = [7.001985e-02,
+    #      -4.336216e-03,
+    #      -5.009831e-03,
+    #      1.621827e-04,
+    #      -2.471283e-06,
+    #      1.904383e-08,
+    #      -7.189421e-11,
+    #      1.060067e-13]
+    # rho = jnp.power(10, ((((((a[7] * h + a[6]) * h + a[5]) * h + a[4]) * h + a[3]) * h + a[2]) * h + a[1]) * h + a[0])
 
     a_drag = 1/2 * rho * gamma_D * v_r_norm**2 * d * 1e3  #  [kg/m^3]x[m^2/kg]x[km^2/s^2] = [km^2/m s^2] -> need to multiply 1000
 
@@ -475,7 +480,135 @@ def cw_stm(X0, t, n):
 def zero_control(t, s):
     return jnp.zeros(3)
 
+def random_control(t, s, u_max):
+    return jnp.zeros()
 
+def sample_range(min, max):
+    n = np.size(min)
+    return min + np.random.sample(n) * (max - min)
+
+
+# -----------------------------------------------------------
+# Data generation for NN controller
+# -----------------------------------------------------------
+def calculate_residuals(s, t, u, mu, earth_to_sun, T, pflag, update_parameter):
+    x, y, z = s[0], s[1], s[2]
+    xdot, ydot, zdot = s[3], s[4], s[5]
+    gamma_srp, gamma_D, psi = s[6], s[7], s[8]
+    state_eci_ref = jnp.hstack([s[9:15], s[6:9]])  # Reference Orbit state
+
+    # Calculate theta_dot, theta_ddot
+    eci2rsw = rotation_eci2rsw(state_eci_ref[:3], state_eci_ref[3:6])
+
+    # calculate ECI position of spacecraft
+    eci_sc = lvlh_to_eci(state_eci_ref[:6], s[:6])  # spacecraft r and v in ECI
+
+    # calculate perturbation
+    if pflag[0]:
+        a_srp = solar_radiation_pressure(gamma_srp, eci_sc[:3], earth_to_sun)
+    else:
+        a_srp = jnp.zeros(3)
+
+    if pflag[1]:
+        a_drag = drag_acceleration(gamma_D, eci_sc)
+    else:
+        a_drag = jnp.zeros(3)
+
+    d_ECI = a_srp + a_drag  # in ECI frame
+    d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
+
+    # calculate perturbated control input
+    if pflag[2] and jnp.any(u):
+        u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+    else:
+        u_p = u
+
+    acc_residuals = d_rsw + u_p
+
+    if update_parameter:
+        dparam_dt = parameter_dynamics(t, T)
+    else:
+        dparam_dt = jnp.zeros(3)
+
+    return acc_residuals, dparam_dt, eci_sc, eci_sc
+
+
+def calculate_residuals_with_perturbations(s, t, u, mu, earth_to_sun, T):
+    x, y, z = s[0], s[1], s[2]
+    xdot, ydot, zdot = s[3], s[4], s[5]
+    gamma_srp, gamma_D, psi = s[6], s[7], s[8]
+    state_eci_ref = jnp.hstack([s[9:15], s[6:9]])  # Reference Orbit state
+
+    # Calculate theta_dot, theta_ddot
+    eci2rsw = rotation_eci2rsw(state_eci_ref[:3], state_eci_ref[3:6])
+
+    # calculate ECI position of spacecraft
+    eci_sc = lvlh_to_eci(state_eci_ref[:6], s[:6])  # spacecraft r and v in ECI
+
+    # calculate perturbation
+    a_srp = solar_radiation_pressure(gamma_srp, eci_sc[:3], earth_to_sun)
+    a_drag = drag_acceleration(gamma_D, eci_sc)
+    d_ECI = a_srp + a_drag  # in ECI frame
+    d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
+
+    # calculate perturbated control input
+    u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+
+    acc_residuals = d_rsw + u_p
+
+    dparam_dt = parameter_dynamics(t, T)
+
+    return acc_residuals, dparam_dt
+
+
+def generate_data(init_oe_range, init_rel_rv_range, u_range, param_range, n_sample):
+    """
+    Generate data for Neural Net training
+    """
+
+    # constants
+    earth_to_sun = compute_earth_to_sun()
+    R_EARTH = 6378
+    mu = MU_EARTH * 1e-9
+    pflag = [True, True, True]  # include all perturbations
+    update_parameter = True     # update parameters
+
+    INPUT_SIZE = 16  # state(15), time(1)
+    OUT_SIZE = 6   # residual(3), parameter derivativ(3)
+
+    datasets = np.zeros((n_sample, INPUT_SIZE+OUT_SIZE))
+
+    calculate_residuals_jit = jax.jit(calculate_residuals_with_perturbations)
+
+    # Sample points from the oe range
+    idx = 0
+    for i in range(n_sample):
+        oe_ref = sample_range(init_oe_range[0,:], init_oe_range[1,:])    # sample oe for init and reference
+        a = oe_ref[0]
+        e = oe_ref[1]
+        if (a*(1-e) - R_EARTH) < 200:
+            oe_ref[0] = (R_EARTH + 200 + 500 * np.random.rand()) / (1 - oe_ref[1])
+            a = oe_ref[0]
+
+        T = 2 * jnp.pi * np.sqrt(a**3/mu)
+        t = np.random.sample() * T
+        r_ref, v_ref = par2ic(oe_ref)
+        init_rv_rel = sample_range(init_rel_rv_range[0,:], init_rel_rv_range[1,:])
+        params = sample_range(param_range[0,:], param_range[1,:])
+        u = sample_range(u_range[0,:], u_range[1,:])
+        s0 = np.hstack([init_rv_rel, params, np.array(r_ref), np.array(v_ref)])
+        acc_residuals, dparam_dt = calculate_residuals_jit(jnp.array(s0), t, jnp.array(u), mu, earth_to_sun, T)
+        #acc_residuals, dparam_dt = calculate_residuals_with_perturbations(jnp.array(s0), t, jnp.array(u), mu, earth_to_sun, T)
+        datasets[idx,:] = np.hstack([s0, t, acc_residuals, dparam_dt])
+        idx = idx + 1
+
+    return datasets
+
+
+
+# --------------------------------------------------------------
+#  Plotting function
+# --------------------------------------------------------------
 def plot_absolute_orbits(sc, sd):
     fig = plt.figure()
     ax = plt.axes(projection='3d')
