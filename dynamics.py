@@ -151,7 +151,7 @@ def relative_dynamics(s, t, u, mu, earth_to_sun, T,
     state_eci_ref = jnp.hstack([s[9:15], s[6:9]])   # Reference Orbit state
 
     # First calculate the accelaration the reference orbit
-    ref_dot = absolute_dynamics(state_eci_ref, t, u, mu, earth_to_sun, T,
+    ref_dot = absolute_dynamics(state_eci_ref, t, jnp.zeros(3), mu, earth_to_sun, T,
                                 pflag=[False, False, False], update_parameter=False, debug=False)
 
     # Calculate theta_dot, theta_ddot
