@@ -312,21 +312,28 @@ def optimize_with_scipy(N_horizon, control_interval, dt, u_min, u_max, s0_rel_sa
     u_mat_rep = np.repeat(u_mat, control_interval, axis=0)  # (intervalxT) x 3
     u_initial = u_mat_rep.flatten()
 
-    return tspan_optimize, u_optimal, u_initial
+    s_optimal = propagate_relative_from_control(s0_rel_sat, u_optimal, tspan_optimize, fd_relative_4T)
+
+    return s_optimal, u_optimal, tspan_optimize, u_initial
 
 
-def shooting_with_scipy(N_horizon, dt, u_min, u_max, s0_rel_sat, fd_relative_4T,
-                        maxiter=50):
-    tspan_optimize = np.arange(0, N_horizon * dt, dt)
-    u_example = max_control(tspan_optimize, u_max)
-    u_example = u_example.flatten()
-    n = s0_rel_sat.size
+def shooting_with_scipy(N_horizon, control_interval, dt, u_min, u_max, s0_rel_sat, fd_relative_4T,
+                        u_guess=None, maxiter=50):
+
+    tspan_optimize = np.arange(0, N_horizon * control_interval * dt, dt)
+    t_control = np.arange(0, N_horizon * control_interval * dt, control_interval * dt)
+    if u_guess is not None:
+        u_example = u_guess
+    else:
+        u_example = zero_control(t_control)  # 3 x T
+        u_example = u_example.flatten()
+    lent = t_control.size
 
     # to be minimized from control -> control u
     def to_be_minimized_from_control(u_ctrl):
-        u_cost = np.linalg.norm(u_ctrl, ord=1)
-        s_stage = 0  # 1e8 * np.sum(s_propagated[:-1, :6].T @ s_propagated[:-1, :6])
-        s_terminal = 0  # 1e10 * s_propagated[-1, :6].T @ s_propagated[-1, :6]
+        u_mat = u_ctrl.reshape((-1, 3))  # T x 3
+        norm_u_vec = np.linalg.norm(u_mat, ord=1, axis=1)
+        u_cost = np.sum(norm_u_vec) * control_interval
 
         return u_cost
 
@@ -335,8 +342,13 @@ def shooting_with_scipy(N_horizon, dt, u_min, u_max, s0_rel_sat, fd_relative_4T,
 
     # constraint -> set position and velocity to 0
     def constraint_control(u_ctrl):
-        s_propagated = propagate_relative_from_control(s0_rel_sat, u_ctrl, tspan_optimize, fd_relative_4T)
-        return s_propagated[:6, -1] * 1000
+        u_mat = u_ctrl.reshape((-1, 3))  # T x 3
+        norm_u_vec = np.linalg.norm(u_mat, ord=1, axis=1)
+        u_cost = np.sum(norm_u_vec) * control_interval
+        u_mat_rep = np.repeat(u_mat, control_interval, axis=0)   # (intervalxT) x 3
+        u_ctrl_rep = u_mat_rep.flatten()
+        s_propagated = propagate_relative_from_control(s0_rel_sat, u_ctrl_rep, tspan_optimize, fd_relative_4T) * 1000
+        return np.linalg.norm(s_propagated[:6, -1] * 1000, np.inf)
 
     # def jacob_constraint(u_ctrl):
     #     s_bar = np.zeros((N_horizon, n))
@@ -374,8 +386,9 @@ def shooting_with_scipy(N_horizon, dt, u_min, u_max, s0_rel_sat, fd_relative_4T,
 
     t_start = time.time()
 
-    tol = 1e-9
-    nlc = scipy.optimize.NonlinearConstraint(constraint_control, -tol*np.ones(6), tol*np.ones(6))
+    tol = 1e-3
+    print("Start Optimization")
+    nlc = scipy.optimize.NonlinearConstraint(constraint_control, 0.0, 0.0)
 
     result = scipy.optimize.minimize(to_be_minimized_from_control, u_example,
                                      jac=jacob_obj,
@@ -397,12 +410,22 @@ def shooting_with_scipy(N_horizon, dt, u_min, u_max, s0_rel_sat, fd_relative_4T,
     print(f"status: {result.status}")
 
     u_optimal = result.x
-    u_initial = u_example
 
-    cost = to_be_minimized_from_control(u_optimal)
-    constraint_v = constraint_control(u_optimal)
+    # repmat u
+    u_mat = u_optimal.reshape((-1, 3))  # T x 3
+    u_mat_rep = np.repeat(u_mat, control_interval, axis=0)  # (intervalxT) x 3
+    u_optimal = u_mat_rep.flatten()
 
-    return tspan_optimize, u_optimal, u_initial, cost, constraint_v
+    u_mat = u_example.reshape((-1, 3))
+    u_mat_rep = np.repeat(u_mat, control_interval, axis=0)  # (intervalxT) x 3
+    u_initial = u_mat_rep.flatten()
+
+    cost = to_be_minimized_from_control(result.x)
+    constraint_v = constraint_control(result.x)
+
+    s_optimal = propagate_relative_from_control(s0_rel_sat, u_optimal, tspan_optimize, fd_relative_4T)
+
+    return s_optimal, u_optimal, tspan_optimize, u_initial, cost, constraint_v
 
 
 """
@@ -669,6 +692,140 @@ def run_MPC(s0, t_terminate, N_horizon, P, Q, u_max, rho, tol, max_iters, u_dim,
             f"\n\nu_step 2-norm is {np.linalg.norm(u_step, 2)}, 1-norm {np.linalg.norm(u_step, 1)}, inf-norm {np.linalg.norm(u_step, np.inf)}")
         print(
             f"u_max is {u_max}, constraint passed? {np.linalg.norm(u_step, np.inf) <= u_max} and overall {np.linalg.norm(u_scp, np.inf) <= u_max}")
+
+        # Propagate to the next state (i.e., propagate without relying on CVXPY)
+        state_curr = fd_relative_4T(state_curr, t_curr, u_step)
+        state_history[:, t_ind + 1] = state_curr
+
+        # Form the next warm start
+        u_bar_warm = np.vstack([u_scp[1:], u_scp[-1]])
+        s_bar_warm = None
+
+        # prog_bar_mpc.update()
+        # prog_bar_mpc.refresh()
+
+    return t_span_full, state_history, control_history
+
+"""
+Scipy MPC
+"""
+
+def optimize_with_scipy_MPC(fd: callable, t_span: np.ndarray,
+                        P: np.ndarray, Q: np.ndarray,
+                        N: int, s0: np.ndarray, u_max: float, rho: float,
+                        tol: float, max_iters: int, u_dim: int = 3,
+                        s_bar_warm=None, u_bar_warm=None):
+
+    n = s0.shape[0]  # state dimension
+    m = u_dim  # control dimension
+    tspan_optimize = t_span
+
+    if u_bar_warm is None:
+        u_bar = np.zeros((N, m))
+        u_bar = u_bar.flatten()
+    else:
+        u_bar = u_bar_warm.flatten()
+
+    # to be minimized from control -> control u
+    def to_be_minimized_from_control(u_ctrl):
+        u_mat = u_ctrl.reshape((-1, 3))  # T x 3
+        norm_u_vec = np.linalg.norm(u_mat, ord=1, axis=1)
+        u_cost = np.sum(norm_u_vec)
+        s_propagated = propagate_relative_from_control(s0, u_ctrl, tspan_optimize[:-1], fd) * 1000
+        s_stage = np.sum(s_propagated[:6, :-1].T @ P @ s_propagated[:6, :-1])
+        s_terminal = s_propagated[:6, -1].T @ Q @ s_propagated[:6, -1]
+
+        return u_cost + s_stage + s_terminal
+
+    def u_constraint(u_ctrl):
+        u_mat = u_ctrl.reshape((-1, 3))  # T x 3
+        norm_u_vec = np.linalg.norm(u_mat, ord=1, axis=1)
+        return norm_u_vec.flatten()
+
+    nlc = scipy.optimize.NonlinearConstraint(u_constraint, np.zeros(N), u_max * np.ones(N))
+    t_start = time.time()
+
+    result = scipy.optimize.minimize(to_be_minimized_from_control, u_bar,
+                                     # method="Nelder-Mead",
+                                     options={'disp': False, 'maxiter': 50
+                                              # 'gtol': 2e-10, 'eps': 2e-10, 'maxfun': np.inf
+                                              },
+                                     bounds=scipy.optimize.Bounds(-u_max, u_max, keep_feasible=False),
+                                     # constraints=(nlc,)
+                                     )
+
+    t_end = time.time()
+
+    # print("\nResult\n")
+    # print(f"Wall time = {t_end - t_start} seconds")
+    print(f"final cost: {result.fun}")
+    # print(f"message: {result.message}")
+    # print(f"result iters: nit = {result.nit} with nfev = {result.nfev}")
+    # print(f"status: {result.status}")
+
+    u_optimal = result.x.reshape((-1,3))   # T x 3
+    s_optimal = propagate_relative_from_control(s0, result.x, tspan_optimize[:-1], fd)  # 6 x T
+
+    return s_optimal, u_optimal
+
+
+def run_MPC_with_scipy(s0, t_terminate, N_horizon, P, Q, u_max, rho, tol, max_iters, u_dim, dt, fd_relative_4T):
+    # Use this to store the MPC results
+    # t_span_full is the time at each state over the whole trajectory
+    t_span_full = np.arange(0.0, t_terminate + N_horizon * dt, dt)
+
+    # Time index to t_terminate
+    t_ind_last = len(t_span_full) - N_horizon
+    print(
+        f"t_terminate ({t_terminate}) is at index {t_ind_last} of {len(t_span_full)} with value {t_span_full[t_ind_last]}")
+
+    # state_history stores the states that we _actually_ visit
+    # might want to store the MPC predictions in the future as well
+    state_history = np.zeros((s0.shape[0], t_ind_last + 1))
+    state_history[:, 0] = s0
+
+    # control_history stores the control that we _actually_ took
+    control_history = np.zeros((u_dim, t_ind_last))
+
+    # store the instanteneous state
+    state_curr = s0
+
+    # For warm-starting
+    s_bar_warm = None
+    u_bar_warm = None
+
+    # prog_bar_mpc = tqdm(range(t_ind_last), desc='MPC', position=0, leave=True)
+    # prog_bar_mpc = tqdm(range(t_ind_last), desc='MPC')
+
+    for t_ind in range(t_ind_last):
+        t_curr = t_span_full[t_ind]
+
+        # For each MPC solve, extract the time array
+        t_scp_extract = t_span_full[t_ind:t_ind + N_horizon + 1]
+        # print(f"SCP time scale shape {t_scp_extract.shape}")
+
+        # Use Sequential Convex Programming to calculate the MPC step
+        # N_horizon_curr = t_scp_extract.size - 1
+        # s_scp is (time + 1, state dim)
+        # u_scp is (time, control dim)
+        s_scp, u_scp = optimize_with_scipy_MPC(fd_relative_4T, t_scp_extract,
+                                               P, Q, N_horizon, state_curr,
+                                               u_max, rho, tol, max_iters, u_dim,
+                                               s_bar_warm=s_bar_warm, u_bar_warm=u_bar_warm)
+
+        # Extract the action we need to take now
+        assert u_scp.shape[1] == u_dim
+        u_step = u_scp[0]
+        assert u_step.shape == (u_dim,)
+        control_history[:, t_ind] = u_step
+
+        print(f"At time {t_curr} of {t_terminate} (index {t_ind} of {t_ind_last})")
+        print("------------------------------------------------------------")
+        print(
+            f"u_step 2-norm is {np.linalg.norm(u_step, 2)}, 1-norm {np.linalg.norm(u_step, 1)}, inf-norm {np.linalg.norm(u_step, np.inf)}")
+        print(
+            f"u_max is {u_max}, constraint passed? {np.linalg.norm(u_step, np.inf) <= u_max} and overall {np.linalg.norm(u_scp, np.inf) <= u_max}")
+        print()
 
         # Propagate to the next state (i.e., propagate without relying on CVXPY)
         state_curr = fd_relative_4T(state_curr, t_curr, u_step)
