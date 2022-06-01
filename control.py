@@ -42,7 +42,7 @@ def absolute_dynamics(s: jnp.ndarray, t: jnp.ndarray, u: jnp.ndarray):
     r = s[:3]
     R = jnp.linalg.norm(r)
     a_body = -MU_EARTH_KM * r / R **3
-    a_total = a_body + u ** 1e-3
+    a_total = a_body + u * 1e-3
 
     sdot = jnp.hstack([s[3:6], a_total])
     return sdot
@@ -198,6 +198,60 @@ def discretize(f, dt, **kwargs):
 
     return integrator
 
+def discretize_Euler(f, dt, **kwargs):
+    """
+    Discretize continuous-time dynamics `f` via Euler integration.
+    """
+
+    def integrator(s, t, u, dt=dt):
+        """
+        Output dicretized function of the form
+        s_k+1 = integrator(s_k, u_k)
+
+        dt can be changed to make it more asynchronous
+        """
+        ds = dt * f(s, t, u, **kwargs)
+
+        return s + ds
+
+    return integrator
+
+
+
+def relative_dynamics_neural_net(s, t, u,
+                                 params,
+                                 state_eci_ref_func,
+                                 model,
+                                 min_max_in,
+                                 min_max_out):
+
+    sdot = relative_dynamics(s, t, u, params=np.zeros(3),
+                             state_eci_ref_func=state_eci_ref_func)
+
+    # construct inputs for NN
+    state_eci_ref = state_eci_ref_func(t).flatten()  # Reference Orbit state
+    nn_input = np.hstack([s, params[:2], np.array(state_eci_ref)])
+    nn_in_normalized = normalize_input(nn_input, min_max_in)
+
+    # predicte residuals using neural net
+    acc_nn_normalized = model.predict(nn_in_normalized, verbose=0)[0]
+    acc_nn = undo_normalize_nn_output(acc_nn_normalized, min_max_out)
+
+    acc_nn = acc_nn[:3] + acc_nn[3:]  # srp + drag
+
+    sdot_total = sdot + np.hstack([np.zeros(3), acc_nn])
+
+    return sdot_total
+
+def normalize_input(state_in, min_max):
+    X_data_normalized = (state_in - min_max[0,:])/(min_max[1,:] - min_max[0,:])
+    reshaped_X = np.reshape(X_data_normalized, (1, -1))
+    return reshaped_X
+
+def undo_normalize_nn_output(state_out, min_max):
+    X_data_unnormalized = state_out * (min_max[1,:] - min_max[0,:]) + min_max[0,:]
+    return X_data_unnormalized
+
 
 def propagate_absolute_from_control(s0, u_func, t_span, fd_absolute):
     s_propagated = np.zeros((s0.shape[0], t_span.shape[0] + 1))
@@ -287,9 +341,7 @@ def optimize_with_scipy(N_horizon, control_interval, dt, u_min, u_max, s0_rel_sa
                                          # constraints=(nlc,)
                                          )
 
-
     t_end = time.time()
-
     print()
     print()
     # print(result)
@@ -586,10 +638,10 @@ def satellite_scp_iteration(fd: callable,
     constraints += [s_cvx[i + 1] == A[i] @ s_cvx[i] + B[i] @ u_cvx[i] + c[i] for i in range(N)]
 
     # State Trust Region constraints
-    constraints += [cvx.norm(s_cvx - s_bar, "inf") <= rho]
+    # constraints += [cvx.norm(s_cvx - s_bar, "inf") <= rho]
 
     # Control Trust Region constraints
-    constraints += [cvx.norm(u_cvx - u_bar, "inf") <= rho]
+    # constraints += [cvx.norm(u_cvx - u_bar, "inf") <= rho]
 
     # Control Constraints
     if u_constraint_active:
@@ -598,8 +650,8 @@ def satellite_scp_iteration(fd: callable,
 
     # Second, write the objective
     objective_control = cvx.norm(u_cvx, 1)
-    objective_stage_cost = cvx.sum([cvx.quad_form(s_cvx[i, :6], Q) for i in range(N)])
-    objective_terminal_state = cvx.quad_form(s_cvx[-1, :6], P)
+    objective_stage_cost = cvx.sum([cvx.quad_form(s_cvx[i, :6]*1000, Q) for i in range(N)])
+    objective_terminal_state = cvx.quad_form(s_cvx[-1, :6]*1000, P)
 
     objective = objective_control + objective_stage_cost + objective_terminal_state
 
@@ -626,6 +678,9 @@ def satellite_scp_iteration(fd: callable,
     s = s_cvx.value
     u = u_cvx.value
     obj = prob.objective.value
+
+    if obj is None:
+        obj = 1e10
 
     # print(f"Constraint u -> {np.linalg.norm(u, np.inf)}")
 
@@ -732,8 +787,8 @@ def optimize_with_scipy_MPC(fd: callable, t_span: np.ndarray,
         norm_u_vec = np.linalg.norm(u_mat, ord=1, axis=1)
         u_cost = np.sum(norm_u_vec)
         s_propagated = propagate_relative_from_control(s0, u_ctrl, tspan_optimize[:-1], fd) * 1000
-        s_stage = np.sum(s_propagated[:6, :-1].T @ P @ s_propagated[:6, :-1])
-        s_terminal = s_propagated[:6, -1].T @ Q @ s_propagated[:6, -1]
+        s_stage = np.sum(s_propagated[:6, :-1].T @ Q @ s_propagated[:6, :-1])
+        s_terminal = s_propagated[:6, -1].T @ P @ s_propagated[:6, -1]
 
         return u_cost + s_stage + s_terminal
 
@@ -747,7 +802,7 @@ def optimize_with_scipy_MPC(fd: callable, t_span: np.ndarray,
 
     result = scipy.optimize.minimize(to_be_minimized_from_control, u_bar,
                                      # method="Nelder-Mead",
-                                     options={'disp': False, 'maxiter': 50
+                                     options={'disp': True, 'maxiter': 50
                                               # 'gtol': 2e-10, 'eps': 2e-10, 'maxfun': np.inf
                                               },
                                      bounds=scipy.optimize.Bounds(-u_max, u_max, keep_feasible=False),
@@ -841,10 +896,85 @@ def run_MPC_with_scipy(s0, t_terminate, N_horizon, P, Q, u_max, rho, tol, max_it
     return t_span_full, state_history, control_history
 
 
+def run_MPC_with_scipy_NN(s0, t_terminate, N_horizon, P, Q, u_max, rho, tol, max_iters, u_dim, dt,
+                          fd_relative_4T, fd_relative_4T_NN):
+    # Use this to store the MPC results
+    # t_span_full is the time at each state over the whole trajectory
+    t_span_full = np.arange(0.0, t_terminate + N_horizon * dt, dt)
+
+    # Time index to t_terminate
+    t_ind_last = len(t_span_full) - N_horizon
+    print(
+        f"t_terminate ({t_terminate}) is at index {t_ind_last} of {len(t_span_full)} with value {t_span_full[t_ind_last]}")
+
+    # state_history stores the states that we _actually_ visit
+    # might want to store the MPC predictions in the future as well
+    state_history = np.zeros((s0.shape[0], t_ind_last + 1))
+    state_history[:, 0] = s0
+
+    # control_history stores the control that we _actually_ took
+    control_history = np.zeros((u_dim, t_ind_last))
+
+    # store the instanteneous state
+    state_curr = s0
+
+    # For warm-starting
+    s_bar_warm = None
+    u_bar_warm = None
+
+    # prog_bar_mpc = tqdm(range(t_ind_last), desc='MPC', position=0, leave=True)
+    # prog_bar_mpc = tqdm(range(t_ind_last), desc='MPC')
+
+    for t_ind in range(t_ind_last):
+        t_curr = t_span_full[t_ind]
+
+        # For each MPC solve, extract the time array
+        t_scp_extract = t_span_full[t_ind:t_ind + N_horizon + 1]
+        # print(f"SCP time scale shape {t_scp_extract.shape}")
+
+        # Use Sequential Convex Programming to calculate the MPC step
+        # N_horizon_curr = t_scp_extract.size - 1
+        # s_scp is (time + 1, state dim)
+        # u_scp is (time, control dim)
+        # for planning use NN model
+        s_scp, u_scp = optimize_with_scipy_MPC(fd_relative_4T_NN, t_scp_extract,
+                                               P, Q, N_horizon, state_curr,
+                                               u_max, rho, tol, max_iters, u_dim,
+                                               s_bar_warm=s_bar_warm, u_bar_warm=u_bar_warm)
+
+        # Extract the action we need to take now
+        assert u_scp.shape[1] == u_dim
+        u_step = u_scp[0]
+        assert u_step.shape == (u_dim,)
+        control_history[:, t_ind] = u_step
+
+        print(f"At time {t_curr} of {t_terminate} (index {t_ind} of {t_ind_last})")
+        print("------------------------------------------------------------")
+        print(
+            f"u_step 2-norm is {np.linalg.norm(u_step, 2)}, 1-norm {np.linalg.norm(u_step, 1)}, inf-norm {np.linalg.norm(u_step, np.inf)}")
+        print(
+            f"u_max is {u_max}, constraint passed? {np.linalg.norm(u_step, np.inf) <= u_max} and overall {np.linalg.norm(u_scp, np.inf) <= u_max}")
+        print()
+
+        # Propagate to the next state (i.e., propagate without relying on CVXPY)
+        # for propagation use truth model
+        state_curr = fd_relative_4T(state_curr, t_curr, u_step) # + sigma * np.random.randn(6)
+        state_history[:, t_ind + 1] = state_curr
+
+        # Form the next warm start
+        u_bar_warm = np.vstack([u_scp[1:], u_scp[-1]])
+        s_bar_warm = None
+
+        # prog_bar_mpc.update()
+        # prog_bar_mpc.refresh()
+
+    return t_span_full, state_history, control_history
+
+
 """
 Plot functions
 """
-def plot_mpc_control(t_mpc, s_mpc, u_mpc, u_max):
+def plot_mpc_control(t_mpc, s_mpc, u_mpc, u_max, filelabel="", is_save=False):
     print(f"Shapes: t={t_mpc.shape}, s={s_mpc.shape}, u={u_mpc.shape}, norm(u)={np.linalg.norm(u_mpc, axis=0).shape}")
 
     # plt.plot(tspan_optimize, np.linalg.norm(u_example.reshape(-1, 3), np.inf, axis=1), label="u initial")
@@ -854,9 +984,13 @@ def plot_mpc_control(t_mpc, s_mpc, u_mpc, u_max):
     plt.ylabel("$||u||_\infty$")
     plt.axhline(u_max, c='k', linestyle='--')
     plt.legend()
+    plt.tight_layout()
+    if is_save:
+        plt.savefig("./Fig/control_history_" + filelabel + ".png")
+
     plt.show()
 
-    dn.plot_relative_orbit(t_mpc[:s_mpc.shape[1]], s_mpc.T)
+    dn.plot_relative_orbit(t_mpc[:s_mpc.shape[1]], s_mpc.T, filelabel, is_save)
 
 
 def plot_control_trajectory(s_mpc):
@@ -886,10 +1020,11 @@ def plot_control_trajectory(s_mpc):
     fig = plt.figure()
     ax = fig.add_subplot(projection='3d')
     ax.plot(s_mpc[0, :], s_mpc[1, :], zs=s_mpc[2, :], zdir='z', label='MPC Curve')
+    plt.tight_layout()
     plt.show()
 
 
-def plot_control_trajectory2(s_mpc, s_mpci):
+def plot_control_trajectory2(s_mpc, s_mpci, filelabel="", is_save=False):
     # 2D Plot -----------------------------------------
     fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(8, 4), dpi=200)
     print(s_mpc[0, :].shape)
@@ -917,16 +1052,22 @@ def plot_control_trajectory2(s_mpc, s_mpci):
     # fig.suptitle("Clairevoyant MPC Trajectory\n")
     plt.tight_layout(pad=0.4, w_pad=0.5, h_pad=1.5)
     ax[0].legend()
+    plt.tight_layout()
+
+    if is_save:
+        plt.savefig("./Fig/trajectory2d_" + filelabel + ".png")
+
     plt.show()
 
     # 3D Plot -----------------------------------------
     fig = plt.figure()
     ax = fig.add_subplot(projection='3d')
     ax.plot(s_mpc[0, :], s_mpc[1, :], zs=s_mpc[2, :], zdir='z', label='MPC Curve')
+    plt.tight_layout()
     plt.show()
 
 
-def plot_mpc_trajectory(s_mpc, N_total_mpc, N_horizon_mpc):
+def plot_mpc_trajectory(s_mpc, N_total_mpc, N_horizon_mpc, filelabel="", is_save=True):
     # colored -----------------------------------------
     fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(8, 4), dpi=200)
 
@@ -952,4 +1093,25 @@ def plot_mpc_trajectory(s_mpc, N_total_mpc, N_horizon_mpc):
         # plt.show(block=False)
 
     plt.tight_layout()
+
+    plt.savefig("./Fig/trajectory_"+ filelabel + ".png")
     plt.show()
+
+def compute_total_cost_mpc(s_mpc, u_mpc, P, Q):
+    """
+    Compute the total cost of the MPC trajectory
+    """
+    norm_u_vec = np.linalg.norm(u_mpc, ord=1, axis=0)
+    u_cost = np.sum(norm_u_vec)
+    s_mpc = s_mpc * 1000
+    s_stage = np.sum(s_mpc[:6, :-1].T @ Q @ s_mpc[:6, :-1])
+    s_terminal = s_mpc[:6, -1].T @ P @ s_mpc[:6, -1]
+    total = u_cost + s_stage + s_terminal
+
+    print("Cost of MPC Trajectory:")
+    print(" stage cost (state): ", s_stage)
+    print(" fuel cost         : ", u_cost)
+    print(" Terminal cost     : ", s_terminal)
+    print(" Total cost        : ", total)
+
+    return total

@@ -549,16 +549,20 @@ def calculate_residuals_with_perturbations(s, t, u, mu, earth_to_sun, T):
     a_srp = solar_radiation_pressure(gamma_srp, eci_sc[:3], earth_to_sun)
     a_drag = drag_acceleration(gamma_D, eci_sc)
     d_ECI = a_srp + a_drag  # in ECI frame
-    d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
+
+    a_srp_rsw = eci2rsw @ a_srp
+    a_drag_rsw = eci2rsw @ a_drag
+    # d_rsw = eci2rsw @ d_ECI  # convert to rsw frame
 
     # calculate perturbated control input
-    u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
+    # u_p = u
+    # u_p = thermal_fluttering(psi, u, earth_to_sun, eci_sc, eci2rsw)
 
-    acc_residuals = d_rsw + u_p
+    # acc_residuals = d_rsw + u_p
 
-    dparam_dt = parameter_dynamics(t, T)
+    # dparam_dt = parameter_dynamics(t, T)
 
-    return acc_residuals, dparam_dt
+    return a_srp_rsw, a_drag_rsw
 
 
 def generate_data(init_oe_range, init_rel_rv_range, u_range, param_range, n_sample):
@@ -574,7 +578,7 @@ def generate_data(init_oe_range, init_rel_rv_range, u_range, param_range, n_samp
     update_parameter = True     # update parameters
 
     INPUT_SIZE = 16  # state(15), time(1)
-    OUT_SIZE = 6   # residual(3), parameter derivativ(3)
+    OUT_SIZE = 6   # acc_srp, acc_drag
 
     datasets = np.zeros((n_sample, INPUT_SIZE+OUT_SIZE))
 
@@ -597,9 +601,9 @@ def generate_data(init_oe_range, init_rel_rv_range, u_range, param_range, n_samp
         params = sample_range(param_range[0,:], param_range[1,:])
         u = sample_range(u_range[0,:], u_range[1,:])
         s0 = np.hstack([init_rv_rel, params, np.array(r_ref), np.array(v_ref)])
-        acc_residuals, dparam_dt = calculate_residuals_jit(jnp.array(s0), t, jnp.array(u), mu, earth_to_sun, T)
+        acc_srp, acc_drag = calculate_residuals_jit(jnp.array(s0), t, jnp.array(u), mu, earth_to_sun, T)
         #acc_residuals, dparam_dt = calculate_residuals_with_perturbations(jnp.array(s0), t, jnp.array(u), mu, earth_to_sun, T)
-        datasets[idx,:] = np.hstack([s0, t, acc_residuals, dparam_dt])
+        datasets[idx,:] = np.hstack([s0, t, acc_srp, acc_drag])
         idx = idx + 1
 
     return datasets
@@ -667,7 +671,7 @@ def plot_relative_orbit_from_abs(tspan, sc, sd):
     return x_lvlh
 
 
-def plot_relative_orbit(tspan, s_rel):
+def plot_relative_orbit(tspan, s_rel, filelabel="", is_save=False):
     plt.figure()
     plt.subplot(2, 1, 1)
     lab = ["x", "y", "z", "vx", "vy", "vz"]
@@ -685,4 +689,7 @@ def plot_relative_orbit(tspan, s_rel):
     plt.xlabel('Time [s]')
     plt.ylabel('Velocity [km/s]')
     plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("./Fig/relative_orbit_"+filelabel+".png")
     plt.show()
